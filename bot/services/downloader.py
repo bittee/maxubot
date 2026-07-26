@@ -1,14 +1,15 @@
 """Завантаження медіа: yt-dlp для відео/аудіо, gallery-dl для фото-каруселей."""
 import asyncio
+import itertools
 import logging
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import yt_dlp
 
@@ -21,9 +22,46 @@ VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXT = {".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav"}
 
+ProgressCallback = Callable[[str], None]
+
 
 class DownloadError(Exception):
-    """Не вдалося завантажити медіа за посиланням."""
+    """Не вдалося завантажити медіа. Текст — зрозуміле повідомлення для юзера."""
+
+    def __init__(self, message: str, *, needs_auth: bool = False):
+        super().__init__(message)
+        self.needs_auth = needs_auth
+
+
+def classify_error(err: Exception) -> DownloadError:
+    """Перетворює помилку yt-dlp на зрозуміле повідомлення."""
+    text = str(err).lower()
+    if any(m in text for m in ("login required", "sign in", "cookies", "authentication",
+                               "not logged in", "requested content is not available",
+                               "rate-limit reached")):
+        return DownloadError(
+            "Потрібна авторизація — пост доступний лише залогіненим користувачам. "
+            "Адмін може додати cookies (див. README).", needs_auth=True,
+        )
+    if "private" in text:
+        return DownloadError("Пост приватний — я не маю до нього доступу.")
+    if any(m in text for m in ("geo", "not available in your country", "region")):
+        return DownloadError("Контент недоступний у регіоні сервера (геоблок).")
+    if any(m in text for m in ("age", "18 years")):
+        return DownloadError("Контент з віковим обмеженням — потрібні cookies акаунта.")
+    if any(m in text for m in ("removed", "deleted", "no longer available",
+                               "video unavailable", "404")):
+        return DownloadError("Пост видалено або він більше недоступний.")
+    if any(m in text for m in ("timed out", "timeout", "connection", "temporary")):
+        return DownloadError("Джерело не відповідає. Спробуй ще раз за хвилину.")
+    return DownloadError("Не вдалося завантажити за цим посиланням.")
+
+
+def _is_transient(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(m in text for m in ("timed out", "timeout", "connection reset",
+                                   "connection aborted", "temporary failure",
+                                   "503", "502", "500"))
 
 
 @dataclass
@@ -43,27 +81,39 @@ class DownloadResult:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
-ProgressCallback = Callable[[str], None]
-
-
 class Downloader:
     def __init__(self, config: Config):
         self.config = config
         self._sem = asyncio.Semaphore(config.max_concurrent_downloads)
         self._aria2c = shutil.which("aria2c") is not None
+        self._cookie_cycle = itertools.cycle(config.cookies_files) \
+            if config.cookies_files else None
         if self._aria2c:
             log.info("aria2c знайдено — багатопотокове завантаження увімкнено.")
+        if len(config.cookies_files) > 1:
+            log.info("Ротація cookies: %d профілів.", len(config.cookies_files))
 
     # ---------- публічний API ----------
 
+    async def probe(self, url: str) -> dict | None:
+        """Швидко тягне метадані (без завантаження): тривалість, формати, назву."""
+        async with self._sem:
+            try:
+                return await asyncio.to_thread(self._probe_sync, url)
+            except Exception as e:
+                log.info("Проба метаданих не вдалася (%s): %s", url, e)
+                return None
+
     async def download(self, link: MediaLink,
-                       progress: ProgressCallback | None = None) -> DownloadResult:
+                       progress: ProgressCallback | None = None,
+                       height_cap: int | None = None,
+                       probed: dict | None = None) -> DownloadResult:
         """Завантажує контент за посиланням: спершу yt-dlp, потім gallery-dl."""
         async with self._sem:
             workdir = self._new_workdir()
             try:
                 return await asyncio.to_thread(
-                    self._download_sync, link, workdir, progress
+                    self._download_sync, link, workdir, progress, height_cap, probed
                 )
             except Exception:
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -81,7 +131,10 @@ class Downloader:
 
     # ---------- yt-dlp ----------
 
-    def _base_opts(self, workdir: Path) -> dict:
+    def _next_cookiefile(self) -> str | None:
+        return next(self._cookie_cycle) if self._cookie_cycle else None
+
+    def _base_opts(self, workdir: Path, cookiefile: str | None = None) -> dict:
         opts = {
             "outtmpl": str(workdir / "%(title).80B [%(id)s].%(ext)s"),
             "quiet": True,
@@ -91,10 +144,11 @@ class Downloader:
             "restrictfilenames": False,
             "socket_timeout": 30,
             "retries": 3,
-            "concurrent_fragment_downloads": 4,
+            "concurrent_fragment_downloads": 8,
         }
-        if self.config.cookies_file:
-            opts["cookiefile"] = self.config.cookies_file
+        cookiefile = cookiefile or self._next_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
         # aria2c: багатопотокове скачування прямих URL (для HLS/DASH-фрагментів
         # yt-dlp сам обирає нативний завантажувач).
         if self._aria2c:
@@ -103,6 +157,18 @@ class Downloader:
                 "aria2c": ["-x8", "-s8", "-k1M", "--summary-interval=0"],
             }
         return opts
+
+    def _probe_sync(self, url: str) -> dict:
+        opts = {
+            "quiet": True, "no_warnings": True, "socket_timeout": 20,
+            "playlist_items": "1", "extract_flat": False,
+        }
+        cookiefile = self._next_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return self._flatten_info(info or {})
 
     @staticmethod
     def _progress_hook(progress: ProgressCallback):
@@ -132,21 +198,68 @@ class Downloader:
 
         return hook
 
-    def _download_sync(self, link: MediaLink, workdir: Path,
-                       progress: ProgressCallback | None = None) -> DownloadResult:
+    def _format_ladder(self, height_cap: int | None,
+                       probed: dict | None) -> list[str]:
+        """Селектори форматів: перший — розрахований за метаданими, далі фолбеки."""
         limit = self.config.max_file_mb
-        # Від найкращої якості, що влазить у ліміт, до найгіршої.
-        # З локальним Bot API (ліміт ~2 ГБ) перший селектор спрацьовує майже завжди.
-        format_ladder = [
-            f"bv*[filesize<{limit}M]+ba/b[filesize<{limit}M]/bv*+ba/b",
+        cap = f"[height<={height_cap}]" if height_cap else ""
+        ladder = []
+
+        # Якщо є метадані з розмірами — обираємо висоту одразу, без перебору.
+        best_h = self._best_height_under_limit(probed) if probed else None
+        if best_h and (not height_cap or best_h <= height_cap):
+            ladder.append(f"bv*[height<={best_h}]+ba/b[height<={best_h}]")
+
+        ladder += [
+            f"bv*{cap}[filesize<{limit}M]+ba/b{cap}[filesize<{limit}M]/bv*{cap}+ba/b{cap}",
             "bv*[height<=720]+ba/b[height<=720]",
             "bv*[height<=480]+ba/b[height<=480]",
             "b",
         ]
+        return ladder
+
+    def _best_height_under_limit(self, info: dict) -> int | None:
+        """За реальними розмірами форматів знаходить максимальну висоту,
+        сумарний розмір якої влазить у ліміт."""
+        formats = info.get("formats") or []
+        duration = info.get("duration") or 0
+        limit_bytes = self.config.max_file_mb * 1024 * 1024 * 0.95
+
+        def est_size(f: dict) -> float | None:
+            size = f.get("filesize") or f.get("filesize_approx")
+            if size:
+                return float(size)
+            tbr = f.get("tbr")  # кбіт/с
+            if tbr and duration:
+                return tbr * 1000 / 8 * duration
+            return None
+
+        audio_sizes = [est_size(f) for f in formats
+                       if f.get("acodec") not in (None, "none")
+                       and f.get("vcodec") in (None, "none")]
+        audio_size = min((s for s in audio_sizes if s), default=0)
+
+        best = None
+        for f in formats:
+            if f.get("vcodec") in (None, "none") or not f.get("height"):
+                continue
+            size = est_size(f)
+            if size is None:
+                continue
+            total = size + (0 if f.get("acodec") not in (None, "none") else audio_size)
+            if total <= limit_bytes:
+                best = max(best or 0, f["height"])
+        return best
+
+    def _download_sync(self, link: MediaLink, workdir: Path,
+                       progress: ProgressCallback | None = None,
+                       height_cap: int | None = None,
+                       probed: dict | None = None) -> DownloadResult:
+        limit = self.config.max_file_mb
         info: dict | None = None
         last_err: Exception | None = None
 
-        for fmt in format_ladder:
+        for fmt in self._format_ladder(height_cap, probed):
             self._clear_dir(workdir)
             opts = self._base_opts(workdir) | {
                 "format": fmt,
@@ -155,8 +268,7 @@ class Downloader:
             if progress:
                 opts["progress_hooks"] = [self._progress_hook(progress)]
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(link.url, download=True)
+                info = self._extract_with_retry(link.url, opts)
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 log.info("yt-dlp (%s) не впорався: %s", fmt, e)
@@ -178,10 +290,28 @@ class Downloader:
 
         files = self._collect_files(workdir)
         if files:  # останній формат дав файл, хай і великий — віддамо помилку розміру
-            raise DownloadError(
-                f"Файл завеликий для Telegram (ліміт {limit} МБ)."
-            )
-        raise DownloadError(str(last_err) if last_err else "Не знайшов медіа за посиланням.")
+            raise DownloadError(f"Файл завеликий для Telegram (ліміт {limit} МБ).")
+        if last_err:
+            raise classify_error(last_err)
+        raise DownloadError("Не знайшов медіа за посиланням.")
+
+    def _extract_with_retry(self, url: str, opts: dict) -> dict:
+        """Одна спроба + повтор при мережевому збої або з іншим cookies-профілем."""
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as e:
+            retry_opts = None
+            if _is_transient(e):
+                time.sleep(2)
+                retry_opts = opts
+            elif (classify_error(e).needs_auth
+                  and len(self.config.cookies_files) > 1):
+                retry_opts = opts | {"cookiefile": self._next_cookiefile()}
+            if retry_opts is None:
+                raise
+            with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                return ydl.extract_info(url, download=True)
 
     def _download_audio_sync(self, url: str, workdir: Path) -> DownloadResult:
         opts = self._base_opts(workdir) | {
@@ -194,10 +324,9 @@ class Downloader:
             }],
         }
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = self._extract_with_retry(url, opts)
         except yt_dlp.utils.DownloadError as e:
-            raise DownloadError(f"Не вдалося витягти аудіо: {e}") from e
+            raise classify_error(e) from e
 
         files = [f for f in self._collect_files(workdir) if f.suffix.lower() in AUDIO_EXT]
         if not files:
@@ -218,8 +347,9 @@ class Downloader:
                     info: dict | None) -> DownloadResult | None:
         self._clear_dir(workdir)
         cmd = ["gallery-dl", "--directory", str(workdir), "--range", "1-10", link.url]
-        if self.config.cookies_file:
-            cmd[1:1] = ["--cookies", self.config.cookies_file]
+        cookiefile = self._next_cookiefile()
+        if cookiefile:
+            cmd[1:1] = ["--cookies", cookiefile]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=180, check=False,
@@ -275,9 +405,8 @@ class Downloader:
         return info
 
     def _new_workdir(self) -> Path:
-        d = Path(tempfile.mkdtemp(prefix=f"dl-{uuid.uuid4().hex[:8]}-",
-                                  dir=self.config.download_dir))
-        return d
+        return Path(tempfile.mkdtemp(prefix=f"dl-{uuid.uuid4().hex[:8]}-",
+                                     dir=self.config.download_dir))
 
     @staticmethod
     def _clear_dir(d: Path) -> None:
@@ -289,9 +418,8 @@ class Downloader:
 
     @staticmethod
     def _collect_files(workdir: Path) -> list[Path]:
-        files = [f for f in sorted(workdir.rglob("*"))
-                 if f.is_file() and f.suffix.lower() in VIDEO_EXT | IMAGE_EXT | AUDIO_EXT]
-        return files
+        return [f for f in sorted(workdir.rglob("*"))
+                if f.is_file() and f.suffix.lower() in VIDEO_EXT | IMAGE_EXT | AUDIO_EXT]
 
     @staticmethod
     def _size_mb(f: Path) -> float:

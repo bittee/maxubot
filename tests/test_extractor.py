@@ -12,7 +12,7 @@ def test_finds_multiple_platforms():
         "https://www.instagram.com/p/ABC123/ і ще "
         "https://x.com/user/status/999 та https://youtu.be/dQw4w9WgXcQ"
     )
-    platforms = [l.platform for l in find_media_links(text)]
+    platforms = [link.platform for link in find_media_links(text)]
     assert platforms == ["Instagram", "X", "YouTube"]
 
 

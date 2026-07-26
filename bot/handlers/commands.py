@@ -1,7 +1,10 @@
-"""Команди /start та /help."""
+"""Команди /start, /help та /stats."""
 from aiogram import Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+
+from bot.config import Config
+from bot.services.stats import Stats
 
 router = Router(name="commands")
 
@@ -29,3 +32,10 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message, config: Config, stats: Stats) -> None:
+    if not message.from_user or message.from_user.id not in config.admin_ids:
+        return  # мовчимо для не-адмінів
+    await message.answer(stats.render())
