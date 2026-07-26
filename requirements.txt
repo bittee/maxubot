@@ -3,3 +3,5 @@ yt-dlp>=2025.6.9
 gallery-dl>=1.29
 aiofiles>=23.2
 python-dotenv>=1.0
+redis>=5.0
+uvloop>=0.19; sys_platform != "win32"

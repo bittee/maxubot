@@ -4,9 +4,11 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yt_dlp
 
@@ -41,19 +43,28 @@ class DownloadResult:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
+ProgressCallback = Callable[[str], None]
+
+
 class Downloader:
     def __init__(self, config: Config):
         self.config = config
         self._sem = asyncio.Semaphore(config.max_concurrent_downloads)
+        self._aria2c = shutil.which("aria2c") is not None
+        if self._aria2c:
+            log.info("aria2c знайдено — багатопотокове завантаження увімкнено.")
 
     # ---------- публічний API ----------
 
-    async def download(self, link: MediaLink) -> DownloadResult:
+    async def download(self, link: MediaLink,
+                       progress: ProgressCallback | None = None) -> DownloadResult:
         """Завантажує контент за посиланням: спершу yt-dlp, потім gallery-dl."""
         async with self._sem:
             workdir = self._new_workdir()
             try:
-                return await asyncio.to_thread(self._download_sync, link, workdir)
+                return await asyncio.to_thread(
+                    self._download_sync, link, workdir, progress
+                )
             except Exception:
                 shutil.rmtree(workdir, ignore_errors=True)
                 raise
@@ -84,13 +95,50 @@ class Downloader:
         }
         if self.config.cookies_file:
             opts["cookiefile"] = self.config.cookies_file
+        # aria2c: багатопотокове скачування прямих URL (для HLS/DASH-фрагментів
+        # yt-dlp сам обирає нативний завантажувач).
+        if self._aria2c:
+            opts["external_downloader"] = {"default": "aria2c"}
+            opts["external_downloader_args"] = {
+                "aria2c": ["-x8", "-s8", "-k1M", "--summary-interval=0"],
+            }
         return opts
 
-    def _download_sync(self, link: MediaLink, workdir: Path) -> DownloadResult:
+    @staticmethod
+    def _progress_hook(progress: ProgressCallback):
+        """Хук yt-dlp: тротлений прогрес для статусного повідомлення."""
+        last_call = [0.0]
+
+        def hook(d: dict) -> None:
+            if d.get("status") != "downloading":
+                return
+            now = time.monotonic()
+            if now - last_call[0] < 2.5:
+                return
+            last_call[0] = now
+            done = d.get("downloaded_bytes") or 0
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            speed = d.get("speed") or 0
+            mb = 1024 * 1024
+            if total:
+                text = (f"⏳ Завантажую… {done * 100 // total}% "
+                        f"({done / mb:.0f}/{total / mb:.0f} МБ · {speed / mb:.1f} МБ/с)")
+            else:
+                text = f"⏳ Завантажую… {done / mb:.0f} МБ · {speed / mb:.1f} МБ/с"
+            try:
+                progress(text)
+            except Exception:
+                pass
+
+        return hook
+
+    def _download_sync(self, link: MediaLink, workdir: Path,
+                       progress: ProgressCallback | None = None) -> DownloadResult:
         limit = self.config.max_file_mb
         # Від найкращої якості, що влазить у ліміт, до найгіршої.
+        # З локальним Bot API (ліміт ~2 ГБ) перший селектор спрацьовує майже завжди.
         format_ladder = [
-            f"bv*[filesize<{limit}M]+ba[filesize<10M]/b[filesize<{limit}M]",
+            f"bv*[filesize<{limit}M]+ba/b[filesize<{limit}M]/bv*+ba/b",
             "bv*[height<=720]+ba/b[height<=720]",
             "bv*[height<=480]+ba/b[height<=480]",
             "b",
@@ -104,6 +152,8 @@ class Downloader:
                 "format": fmt,
                 "merge_output_format": "mp4",
             }
+            if progress:
+                opts["progress_hooks"] = [self._progress_hook(progress)]
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(link.url, download=True)

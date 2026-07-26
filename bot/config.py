@@ -15,6 +15,8 @@ class Config:
     cookies_file: str | None
     max_file_mb: int
     max_concurrent_downloads: int
+    bot_api_url: str | None  # самохостнутий telegram-bot-api (--local), до 2 ГБ
+    redis_url: str | None    # кеш file_id; без Redis — in-memory
 
 
 def load_config() -> Config:
@@ -32,10 +34,16 @@ def load_config() -> Config:
     if cookies and not Path(cookies).exists():
         cookies = None
 
+    bot_api_url = os.getenv("BOT_API_URL", "").strip().rstrip("/") or None
+    # З локальним Bot API ліміт — 2 ГБ; з хмарним — 50 МБ.
+    default_limit = "1950" if bot_api_url else "49"
+
     return Config(
         bot_token=token,
         download_dir=download_dir,
         cookies_file=cookies,
-        max_file_mb=int(os.getenv("MAX_FILE_MB", "49")),
-        max_concurrent_downloads=int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3")),
+        max_file_mb=int(os.getenv("MAX_FILE_MB", default_limit)),
+        max_concurrent_downloads=int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "4")),
+        bot_api_url=bot_api_url,
+        redis_url=os.getenv("REDIS_URL", "").strip() or None,
     )

@@ -13,7 +13,11 @@
   або одразу `/audio <лінк>`
 - 👥 **Групи** — додай бота в чат, і він сам реагуватиме на повідомлення
   з підтримуваними посиланнями (на решту повідомлень мовчить)
-- 📉 Автоматично знижує якість відео, щоб вміститись у ліміт Telegram (50 МБ)
+- 📦 **Файли до 2 ГБ** — через самохостнутий Bot API сервер (у docker-compose
+  з коробки); без нього — до 50 МБ зі зниженням якості
+- ⚡ **Швидкість** — кеш file_id у Redis (повторний лінк віддається < 1 с без
+  завантаження), aria2c (багатопотокове скачування), дедуплікація одночасних
+  завантажень, tmpfs, uvloop, прогрес у статусному повідомленні
 
 ## Швидкий старт
 
@@ -23,18 +27,32 @@
 2. Для роботи в групах: `/setprivacy` → **Disable** (щоб бот бачив усі
    повідомлення в групі, а не тільки команди).
 
-### 2. Запуск через Docker (рекомендовано)
+### 2. Отримай API_ID і API_HASH
+
+Потрібні для самохостнутого Bot API сервера (файли до 2 ГБ):
+[my.telegram.org](https://my.telegram.org) → **API development tools** →
+створи застосунок → скопіюй `api_id` і `api_hash`.
+
+### 3. Запуск через Docker (рекомендовано)
 
 ```bash
 git clone https://github.com/bittee/maxubot.git
 cd maxubot
-cp .env.example .env   # встав свій BOT_TOKEN
+cp .env.example .env   # встав BOT_TOKEN, API_ID, API_HASH
 docker compose up -d --build
 ```
 
-### 3. Запуск без Docker
+Підніметься три контейнери: бот, `telegram-bot-api` (ліміт 2 ГБ) і Redis (кеш).
 
-Потрібні Python 3.11+ і [ffmpeg](https://ffmpeg.org/) у PATH.
+> ⚠️ Якщо бот раніше працював через хмарний Bot API, перед першим запуском
+> на локальному сервері виконай разово:
+> `curl https://api.telegram.org/bot<ТОКЕН>/logOut`
+> (інакше локальний сервер не прийме токен).
+
+### 4. Запуск без Docker (простий режим, до 50 МБ)
+
+Потрібні Python 3.11+ і [ffmpeg](https://ffmpeg.org/) у PATH
+(опційно aria2 — для швидшого скачування).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -43,14 +61,20 @@ cp .env.example .env   # встав свій BOT_TOKEN
 python -m bot.main
 ```
 
+Без `BOT_API_URL` бот працює через хмарний Bot API (ліміт 50 МБ),
+без `REDIS_URL` — кеш file_id тримається в памʼяті процесу.
+
 ## Налаштування (.env)
 
 | Змінна | Обовʼязкова | Опис |
 |---|---|---|
 | `BOT_TOKEN` | ✅ | токен від @BotFather |
+| `API_ID`, `API_HASH` | для Docker | з [my.telegram.org](https://my.telegram.org), для telegram-bot-api сервера |
 | `COOKIES_FILE` | — | шлях до `cookies.txt` (потрібен для Instagram, приватних постів, вікових обмежень) |
-| `MAX_FILE_MB` | — | ліміт розміру файлу, за замовчуванням 49 |
-| `MAX_CONCURRENT_DOWNLOADS` | — | одночасних завантажень, за замовчуванням 3 |
+| `MAX_FILE_MB` | — | ліміт розміру файлу; за замовчуванням 1950 з локальним Bot API, 49 без |
+| `MAX_CONCURRENT_DOWNLOADS` | — | одночасних завантажень, за замовчуванням 4 |
+| `BOT_API_URL` | — | адреса самохостнутого telegram-bot-api (у Docker задається автоматично) |
+| `REDIS_URL` | — | Redis для кешу file_id (у Docker задається автоматично) |
 
 ### Instagram і cookies
 
@@ -68,8 +92,8 @@ Instagram часто вимагає авторизацію. Експортуй c
 
 ## Обмеження
 
-- Bot API дозволяє ботам надсилати файли до **50 МБ** — довгі відео бот
-  спробує завантажити в нижчій якості; якщо не влазить — повідомить.
+- З локальним Bot API сервером (Docker) — файли до **2 ГБ**; через хмарний
+  Bot API — до **50 МБ** (бот автоматично знижує якість, щоб вміститись).
 - Приватні/видалені пости недоступні без cookies.
 - У каруселях надсилається до 10 елементів на альбом.
 
@@ -77,20 +101,23 @@ Instagram часто вимагає авторизацію. Експортуй c
 
 ```
 bot/
-├── main.py               # точка входу (long polling)
+├── main.py               # точка входу (long polling, локальний Bot API, uvloop)
 ├── config.py             # конфіг з .env
 ├── handlers/
 │   ├── commands.py       # /start, /help
-│   ├── links.py          # обробка лінків + /audio
+│   ├── links.py          # обробка лінків + /audio (кеш → дедуп → завантаження)
 │   └── callbacks.py      # кнопка «🎵 Музика»
 ├── services/
 │   ├── extractor.py      # пошук/класифікація лінків у тексті
-│   ├── downloader.py     # yt-dlp + gallery-dl
-│   └── sender.py         # відправка відео/альбомів/аудіо
+│   ├── downloader.py     # yt-dlp (+aria2c) + gallery-dl, прогрес
+│   ├── cache.py          # нормалізація URL, кеш file_id (Redis), дедуплікація
+│   └── sender.py         # відправка відео/альбомів/аудіо + з кешу
 └── utils/
     ├── text.py           # підписи до медіа
     └── tokens.py         # токени для callback-кнопок
 ```
+
+Докладніше про архітектуру і подальші плани — у [PLAN.md](PLAN.md).
 
 ## Тести
 
