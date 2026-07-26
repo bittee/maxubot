@@ -57,5 +57,6 @@ def load_config() -> Config:
         redis_url=os.getenv("REDIS_URL", "").strip() or None,
         admin_ids=admin_ids,
         webhook_url=os.getenv("WEBHOOK_URL", "").strip().rstrip("/") or None,
-        webhook_port=int(os.getenv("WEBHOOK_PORT", "8080")),
+        # Хостинги (Railway, Render тощо) призначають порт через PORT.
+        webhook_port=int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or "8080"),
     )
