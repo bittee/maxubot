@@ -1,0 +1,9 @@
+services:
+  maxubot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./downloads:/app/downloads
+      # Розкоментуй, якщо використовуєш cookies для Instagram:
+      # - ./cookies.txt:/app/cookies.txt:ro
